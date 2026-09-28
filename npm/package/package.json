@@ -1,0 +1,17 @@
+{
+  "name": "@lapius/ytdlpdownloader",
+  "version": "0.0.0",
+  "description": "yt-dlp を fzf のメニューで操作する動画・音声・画像ダウンローダー（コマンド: yd）",
+  "keywords": ["yt-dlp", "youtube", "downloader", "fzf", "cli", "tui", "gallery-dl", "lapius"],
+  "homepage": "https://github.com/Lapius7/ytdlpdownloader",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lapius7/ytdlpdownloader.git"
+  },
+  "license": "MIT",
+  "bin": {
+    "yd": "bin/yd"
+  },
+  "files": ["bin/yd"],
+  "os": ["linux", "darwin"]
+}
