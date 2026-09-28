@@ -1,0 +1,1457 @@
+#!/usr/bin/env zsh
+# yd — yt-dlp をメニューで操作するランチャー
+#   yd                  メニュー
+#   yd <URL>            URL を渡して、動画/音声/画像を選ぶ
+#   yd video|audio|image [URL]
+#   yd batch [URL...|ファイル]
+#   yd history / yd update / yd -h
+
+setopt MAGIC_EQUAL_SUBST EXTENDED_GLOB
+zmodload zsh/datetime
+
+SELF=${0:A}
+CONF=$HOME/.config/yd
+CACHE=$HOME/.cache/yd
+LOGDIR=$HOME/.yd_logs
+RECENT=$CONF/recent_dirs.txt
+HIST=$CONF/history.tsv
+PREFS=$CONF/prefs
+
+A=$'\e[38;5;204m' OK=$'\e[38;5;114m' ER=$'\e[38;5;203m' WN=$'\e[38;5;221m'
+CY=$'\e[38;5;117m' DM=$'\e[38;5;245m' B=$'\e[1m' R=$'\e[0m'
+T=$'\t'
+WSL=0; [[ -r /proc/version && $(</proc/version) == *[Mm]icrosoft* ]] && WSL=1
+YD_VERSION=dev
+[[ -r ${SELF:h:h}/package.json ]] && YD_VERSION=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' ${SELF:h:h}/package.json | head -1); [[ $YD_VERSION == 0.0.0 ]] && YD_VERSION=dev
+
+# プレビューは横幅が足りなければ下に回す
+PVW='right,50%,border-left,noinfo,<50(down,50%,border-top,noinfo)'
+
+unset FZF_DEFAULT_OPTS FZF_DEFAULT_OPTS_FILE
+FZF=(fzf --reverse --no-sort --cycle --ansi --info=hidden --pointer='▶' --marker='✓'
+  --border=rounded --border-label=" ${A}${B}yd${R} " --border-label-pos=3 --padding=0,1
+  --header-first --no-scrollbar --gutter=' '
+  --color='fg:252,hl:204,fg+:255:bold,bg+:236,hl+:204,pointer:204,marker:114,prompt:204,header:252,border:240,label:204,query:255,preview-border:240,footer:243,gutter:-1,ghost:240')
+
+typeset -a MENU_OPTS FILES ARGS
+typeset -A P
+INTR=0 NEXT= TITLE= OUTDIR= ELAPSED=0 INFO_URL= INFO_RC=1 RES_NOTE= COLS=${COLUMNS:-80} USE_COOKIE=0 IN_BATCH=0
+
+# ───────────────────────── 小道具 ─────────────────────────
+
+tilde() { print -r -- ${1/#$HOME/\~} }
+
+pad() { local n=$(( $2 - ${(m)#1} )); (( n < 0 )) && n=0; print -rn -- "$1${(l:$n:: :)}" }
+
+trunc() {
+  local s=$1 w=$2 out= c
+  (( ${(m)#s} <= w )) && { print -r -- $s; return }
+  for c in ${(s::)s}; do
+    (( ${(m)#out} + ${(m)#c} > w - 1 )) && break
+    out+=$c
+  done
+  print -r -- "$out…"
+}
+
+# 2行までに折り返す(2行目は省略)
+wrap2() {
+  local s=$1 w=$2 l1= i=1
+  (( ${(m)#s} <= w )) && { print -r -- $s; return }
+  while (( i <= $#s )); do
+    (( ${(m)#l1} + ${(m)#s[i]} > w )) && break
+    l1+=$s[i]; (( i++ ))
+  done
+  print -r -- $l1
+  trunc "${s[i,-1]}" $w
+}
+
+human() {
+  local n=${1:-0}
+  [[ $n == <-> ]] && (( n > 0 )) || { print -- -; return }
+  numfmt --to=iec --suffix=B --format=%.1f $n 2>/dev/null
+}
+
+fmt_dur() {
+  local s=${1%.*}
+  [[ $s == <-> ]] || { print -- -; return }
+  if (( s >= 3600 )); then printf '%d:%02d:%02d\n' $((s/3600)) $((s%3600/60)) $((s%60))
+  else printf '%d:%02d\n' $((s/60)) $((s%60)); fi
+}
+
+fmt_views() {
+  local n=$1 r
+  [[ $n == <-> ]] || return
+  if (( n >= 100000000 )); then r=$(printf '%.1f億' $(( n / 1e8 )))
+  elif (( n >= 10000 )); then r=$(printf '%.1f万' $(( n / 1e4 )))
+  else r=$n; fi
+  print -r -- "${r/.0/}回"
+}
+
+file_kind() {
+  case ${1:l} in
+    *.(mp4|mkv|webm|mov|avi|flv|m4v|ts)) print video ;;
+    *.(mp3|m4a|opus|flac|wav|ogg|aac|wma)) print audio ;;
+    *.(jpg|jpeg|png|webp|gif|bmp|avif)) print image ;;
+    *) print other ;;
+  esac
+}
+
+kind_icon() {
+  case $(file_kind $1) in video) print -n 🎬 ;; audio) print -n 🎵 ;; image) print -n 📷 ;; *) print -n 📄 ;; esac
+}
+
+qlabel() {
+  case $1 in 2160) print 4K ;; 1440) print 2K ;; 1080) print フルHD ;; 720) print HD ;; 480) print SD ;; 360) print 軽量 ;; esac
+}
+qname() { [[ $1 == <-> ]] && print "${1}p" || print 最高画質 }
+
+load_prefs() {
+  [[ -f $PREFS ]] || return
+  local k v
+  while IFS='=' read -r k v; do [[ -n $k ]] && P[$k]=$v; done < $PREFS
+}
+save_pref() {
+  P[$1]=$2
+  local k
+  for k in ${(ok)P}; do print -r -- "$k=${P[$k]}"; done > $PREFS
+}
+
+save_recent() {
+  local d=${1:A}
+  local -a l=(${(f)"$(cat $RECENT 2>/dev/null)"})
+  l=($d ${l:#$d})
+  print -rl -- ${l[1,8]} > $RECENT
+}
+
+add_history() { # kind
+  local f
+  for f in $FILES; do print -r -- "$EPOCHSECONDS$T$1$T$f"; done >> $HIST
+  local -a l=(${(f)"$(<$HIST)"})
+  (( $#l > 300 )) && print -rl -- ${l[-300,-1]} > $HIST
+}
+
+clip_text() {
+  if (( $+commands[win32yank.exe] )); then win32yank.exe -o --lf
+  elif [[ -n $WAYLAND_DISPLAY ]] && (( $+commands[wl-paste] )); then wl-paste -n
+  elif (( $+commands[xclip] )); then xclip -o -selection clipboard
+  elif (( $+commands[pbpaste] )); then pbpaste
+  fi 2>/dev/null
+}
+clip_url() {
+  local c=${$(clip_text | head -1)//[[:space:]]/}
+  [[ $c == http(s|)://?* ]] && print -r -- $c
+}
+copy_text() {
+  if (( $+commands[win32yank.exe] )); then print -rn -- $1 | win32yank.exe -i
+  elif [[ -n $WAYLAND_DISPLAY ]] && (( $+commands[wl-copy] )); then print -rn -- $1 | wl-copy
+  elif (( $+commands[xclip] )); then print -rn -- $1 | xclip -selection clipboard
+  elif (( $+commands[pbcopy] )); then print -rn -- $1 | pbcopy
+  fi 2>/dev/null
+}
+
+norm_url() {
+  local u=${1//[[:space:]]/}
+  if [[ $u == [A-Za-z0-9_-](#c11) ]]; then REPLY="https://youtu.be/$u"; return 0; fi
+  [[ $u == www.* ]] && u="https://$u"
+  [[ $u == http(s|)://?* ]] || return 1
+  REPLY=$u
+}
+
+parse_urls() { grep -oE 'https?://[^[:space:]"<>]+' | awk '!s[$0]++' }
+
+pause() { print -n "\n  ${DM}何かキーを押すと戻ります${R}"; read -sk1; print }
+
+open_path() {
+  if (( $+commands[wslview] )); then (wslview $1 &>/dev/null &)
+  elif (( WSL )); then (/mnt/c/Windows/explorer.exe "$(wslpath -w $1)" &>/dev/null &)
+  elif (( $+commands[open] )) && [[ $OSTYPE == darwin* ]]; then open $1
+  else (xdg-open $1 &>/dev/null &); fi
+}
+reveal_path() {
+  if (( WSL )); then (/mnt/c/Windows/explorer.exe "/select,$(wslpath -w $1)" &>/dev/null &)
+  elif [[ $OSTYPE == darwin* ]]; then open -R $1
+  else open_path ${1:h}; fi
+}
+open_dir() {
+  if (( WSL )); then (/mnt/c/Windows/explorer.exe "$(wslpath -w $1)" &>/dev/null &)
+  else open_path $1; fi
+}
+
+# ───────────────────────── fzf ─────────────────────────
+
+# menu <ヘッダー> <既定のキー> "キー<TAB>表示" ...   → 選んだキーを REPLY に
+# MENU_OPTS(プレビューなど)と MENU_SEARCH(文字入力で絞り込む)を呼び出し元から渡せる
+menu() {
+  local header=${1//\\n/$'\n'} def=$2; shift 2
+  local pos=1 i sel
+  for (( i = 1; i <= $#; i++ )); do [[ ${argv[i]%%$T*} == $def ]] && { pos=$i; break }; done
+  local -a mode
+  if (( MENU_SEARCH )); then
+    mode=(--prompt='🔍 ' --footer="文字入力で絞り込み · Enter 決定 · Esc 戻る")
+  else
+    mode=(--no-input --bind='j:down,k:up,q:abort' --footer="↑↓ 移動 · Enter 決定 · Esc 戻る")
+  fi
+  sel=$(print -rl -- "$@" | $FZF $mode --delimiter=$T --with-nth=2.. --header=$header \
+    --bind="load:pos($pos)" $MENU_OPTS) || return 1
+  REPLY=${sel%%$T*}
+}
+
+# ask <ヘッダー> <プロンプト> [初期値] [薄い例文]   → 入力を REPLY に
+ask() {
+  local header=${1//\\n/$'\n'} out rc
+  out=$(print -n | $FZF --print-query --prompt=$2 --query=${3:-} --ghost=${4:-} --header=$header \
+    --bind='enter:accept-or-print-query' --footer="Enter 決定 · Esc 戻る")
+  rc=$?
+  (( rc == 130 || rc == 2 )) && return 1
+  REPLY=${out%%$'\n'*}
+}
+
+spin() { # メッセージ コマンド...
+  local msg=$1; shift
+  INTR=0
+  "$@" &
+  local pid=$! i=0 rc
+  local -a f=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  tput civis
+  while kill -0 $pid 2>/dev/null; do
+    if (( INTR )); then pkill -P $pid 2>/dev/null; kill $pid 2>/dev/null; break; fi
+    printf '\r  %s%s%s %s %s(Ctrl+C で中止)%s' $A $f[i%10+1] $R $msg $DM $R
+    (( i++ )); sleep 0.08
+  done
+  wait $pid 2>/dev/null; rc=$?
+  printf '\r\e[2K'; tput cnorm
+  (( INTR )) && return 130
+  return $rc
+}
+
+# ───────────────────────── プレビュー(fzf から呼ばれる) ─────────────────────────
+
+# サムネイルと文字情報を並べる。幅が足りなければ上下に積む
+compose() { # 画像 文字を出す関数(幅を受け取る)
+  local th=$1 fn=$2 w=${FZF_PREVIEW_COLUMNS:-60} h=${FZF_PREVIEW_LINES:-14}
+  local -a img t
+  local chafa=(chafa -f symbols --polite on --animate off)
+  if [[ -s $th ]] && (( w >= 56 && h <= 18 )); then
+    img=("${(@f)$($chafa -s $(( w * 2 / 5 ))x$h -- $th 2>/dev/null)}")
+    local s=${img[1]//$'\e'\[[0-9;]#m/}
+    local iw=${(m)#s}
+    local sp=${(l:$iw:: :)}
+    t=("${(@f)$($fn $(( w - iw - 2 )))}")
+    local i n=$(( $#img > $#t ? $#img : $#t ))
+    for (( i = 1; i <= n; i++ )); do print -r -- "${img[i]:-$sp}$R  ${t[i]}"; done
+  else
+    t=("${(@f)$($fn $w)}")
+    if [[ -s $th ]] && (( h - $#t - 1 >= 4 )); then
+      $chafa -s ${w}x$(( h - $#t - 1 )) -- $th 2>/dev/null; print
+    fi
+    print -rl -- "${t[@]}"
+  fi
+}
+
+info_field() { sed -n "${1}p" $SESS/info 2>/dev/null }
+
+card() { # 情報ファイル サムネイル
+  local info=$1 thumb=$2
+  if [[ ! -s $info ]]; then
+    if [[ -s $info.err ]]; then
+      print -r -- "${WN}情報を取得できませんでした${R}"
+      grep -aE -m2 '^ERROR|\]\[error\]' $info.err | sed -E 's/^(ERROR: |\[[^]]*\]\[error\] )//' | cut -c1-200 | sed "s/^/${DM}/;s/\$/${R}/"
+    else
+      print -r -- "${DM}(情報なし)${R}"
+    fi
+    return
+  fi
+  local -a v=("${(@f)$(<$info)}")
+  local i; for (( i = 1; i <= 10; i++ )); do [[ $v[i] == NA ]] && v[i]=; done
+  [[ $v[3] == <-> ]] && v[3]=$(fmt_dur $v[3])
+  _card_text() {
+    local tw=$1 l
+    for l in "${(@f)$(wrap2 $v[1] $tw)}"; do print -r -- "$B$l$R"; done
+    [[ -n $v[2] ]] && print -r -- "$CY$(trunc $v[2] $tw)$R"
+    print
+    local -a m
+    [[ -n $v[3] ]] && m+=("${DM}長さ$R $v[3]")
+    [[ -n $v[4] ]] && m+=("${DM}再生$R $(fmt_views $v[4])")
+    (( $#m )) && print -r -- "${(j:   :)m}"
+    m=()
+    [[ $v[5] == (#b)(????)(??)(??) ]] && m+=("${DM}公開$R $match[1]/$match[2]/$match[3]")
+    [[ $v[6] == <-> ]] && m+=("${DM}画質$R ${v[6]}p")
+    (( $#m )) && print -r -- "${(j:   :)m}"
+    [[ -n $v[7] ]] && print -r -- "${DM}サイト$R $v[7]"
+    if [[ $v[9] == <-> ]]; then
+      print
+      print -r -- "${A}プレイリスト$R $(trunc "${v[8]:-}" $(( tw - 20 ))) ${DM}($v[9] 本)$R"
+    fi
+  }
+  compose $thumb _card_text
+}
+
+thumb_of() { # ファイルのサムネイル(キャッシュ)のパス
+  local f=$1 k=$(file_kind $1)
+  [[ $k == image ]] && { print -r -- $f; return }
+  [[ $k == (video|audio) ]] || return
+  local key=$(print -r -- "$f $(stat -c %Y -- $f)" | md5sum | cut -c1-32)
+  local out=$CACHE/thumbs/$key.png
+  if [[ ! -s $out ]]; then
+    mkdir -p $CACHE/thumbs
+    if [[ $k == video ]]; then
+      ffmpeg -v error -y -ss 5 -i $f -frames:v 1 -vf scale=480:-2 $out </dev/null 2>/dev/null
+      [[ -s $out ]] || ffmpeg -v error -y -i $f -frames:v 1 -vf scale=480:-2 $out </dev/null 2>/dev/null
+    else
+      ffmpeg -v error -y -i $f -an -frames:v 1 -vf scale=480:-2 $out </dev/null 2>/dev/null
+    fi
+  fi
+  [[ -s $out ]] && print -r -- $out
+}
+
+preview_file() {
+  local f=$1
+  if [[ $f == @* ]]; then return; fi
+  if [[ ! -e $f ]]; then
+    print -r -- "${ER}ファイルが見つかりません$R"; print -r -- "$DM$(tilde $f)$R"; return
+  fi
+  local k=$(file_kind $f)
+  local -a p
+  if [[ $k != other ]]; then
+    p=(${(ps:\t:)"$(ffprobe -v error -show_entries format=duration,bit_rate:stream=codec_type,codec_name,width,height -of json -- $f 2>/dev/null |
+      jq -r '[(.format.duration//"0"),(.format.bit_rate//"0"),([.streams[]|select(.codec_type=="video")][0]|(.codec_name//"-"),(.width//0),(.height//0)),([.streams[]|select(.codec_type=="audio")][0].codec_name//"-")]|@tsv' 2>/dev/null)"})
+  fi
+  _file_text() {
+    local tw=$1 l
+    for l in "${(@f)$(wrap2 ${f:t} $tw)}"; do print -r -- "$B$l$R"; done
+    print
+    print -r -- "${DM}容量$R $(human $(stat -c %s -- $f))"
+    case $k in
+      video) print -r -- "${DM}長さ$R $(fmt_dur $p[1])"
+             print -r -- "${DM}画質$R ${p[4]}×${p[5]}  ${DM}${p[3]} / ${p[6]}$R" ;;
+      audio) print -r -- "${DM}長さ$R $(fmt_dur $p[1])"
+             local br=; [[ $p[2] == <-> ]] && br="  $(( p[2] / 1000 )) kbps"
+             print -r -- "${DM}音質$R ${p[6]}$br" ;;
+      image) print -r -- "${DM}サイズ$R ${p[4]}×${p[5]}" ;;
+    esac
+    print -r -- "${DM}保存$R $(date -r $f '+%Y/%m/%d %H:%M')"
+    print -r -- "${DM}場所$R $(trunc "$(tilde ${f:h})" $(( tw - 5 )))"
+  }
+  compose "$(thumb_of $f)" _file_text
+}
+
+dir_preview() {
+  local d=$1
+  case $d in
+    @browse) print -r -- "${DM}ホーム以下のフォルダを検索して選びます$R"; return ;;
+    @input)  print -r -- "${DM}保存先のパスを直接入力します(無ければ作成)$R"; return ;;
+  esac
+  [[ -d $d ]] || { print -r -- "${WN}まだありません(ダウンロード時に作成します)$R"; return }
+  local av=${$(df -h --output=avail -- $d 2>/dev/null | tail -1)// /}
+  print -r -- "$B$(tilde $d)$R"
+  print -r -- "${DM}空き容量$R $av   ${DM}項目数$R $(command ls -A -- $d | wc -l)"
+  print
+  { if (( $+commands[eza] )); then eza -1 --icons=always --color=always -s modified -r -- $d
+    else command ls -1t --color=always -- $d; fi } 2>/dev/null | head -n $(( ${FZF_PREVIEW_LINES:-20} - 3 ))
+}
+
+# ───────────────────────── 情報の取得 ─────────────────────────
+
+info_job() {
+  local url=$1; shift
+  timeout 45 yt-dlp --no-warnings "$@" -O title -O '%(uploader,channel,creator,uploader_id)s' \
+    -O duration_string -O view_count -O upload_date -O height -O extractor_key \
+    -O playlist_title -O '%(playlist_count,n_entries)s' -O thumbnail -- $url \
+    > $SESS/info.tmp 2> $SESS/info.err || return 1
+  [[ -s $SESS/info.tmp ]] || return 1
+  mv -f $SESS/info.tmp $SESS/info
+  local t=$(sed -n 10p $SESS/info)
+  if [[ $t == http* ]] && curl -sfL --max-time 10 -o $SESS/thumb.raw -- $t; then
+    ffmpeg -v error -y -i $SESS/thumb.raw -vf scale=480:-2 $SESS/thumb.jpg </dev/null 2>/dev/null
+  fi
+  return 0
+}
+
+fetch_info() {
+  local url=$1
+  [[ $url == $INFO_URL ]] && return $INFO_RC
+  command rm -f $SESS/info $SESS/info.err $SESS/thumb.jpg $SESS/thumb.raw
+  local -a opt=(-I 1)
+  [[ $url == *list=* && $url == *(v=|youtu.be/)* ]] && opt=(--no-playlist)
+  (( USE_COOKIE )) && opt+=(${(f)"$(cookie_args)"})
+  spin "情報を取得しています…" info_job $url $opt
+  INFO_RC=$? INFO_URL=$url
+  (( INFO_RC == 130 )) && INFO_URL=
+  TITLE=$(info_field 1); [[ $TITLE == NA ]] && TITLE=
+  return $INFO_RC
+}
+
+hint_for() {
+  local e=$(grep -aE '^ERROR|\]\[error\]' $1 2>/dev/null)
+  case $e in
+    *"Sign in to confirm"*|*"KeyError"*|*"--cookies"*|*[Ll]og\ in*|*"not a bot"*|*"confirm your age"*|*"login required"*|*"requires authentication"*)
+      print "💡 ログインが必要な動画です(--cookies-from-browser でブラウザの Cookie を使う必要があります)" ;;
+    *"HTTP Error 403"*|*"Requested format is not available"*|*nsig*|*"Signature extraction"*|*"Unable to extract"*)
+      print "💡 yt-dlp が古い可能性があります → 「yt-dlp を更新して再試行」" ;;
+    *"Private video"*|*"private"*) print "💡 非公開の動画です" ;;
+    *"Unsupported URL"*) print "💡 対応していない URL です(画像の投稿なら「画像」モードで gallery-dl を試せます)" ;;
+    *[Uu]navailable*|*"not available"*|*"removed"*|*"HTTP Error 404"*)
+      print "💡 削除された・地域制限がある・URL が間違っている、のどれかです" ;;
+    *"name resolution"*|*"timed out"*|*"Connection"*|*"Unable to download webpage"*)
+      print "💡 ネットワーク接続を確認してください" ;;
+    *"No space left"*) print "💡 保存先の空き容量が足りません" ;;
+    *ffmpeg*) print "💡 ffmpeg の処理で失敗しました(ログを確認してください)" ;;
+  esac
+}
+
+err_summary() {
+  local l w=$(( COLS - 8 ))
+  for l in ${(f)"$(grep -aE '^ERROR|\]\[error\]' $1 2>/dev/null | tail -2)"}; do
+    print -r -- "$DM$(trunc "${l#ERROR: }" $w)$R"
+  done
+  local h=$(hint_for $1)
+  [[ -n $h ]] && print -r -- "$WN$h$R"
+}
+
+# 情報が取れないときは、再試行・更新・そのまま続行を選ばせる
+need_info() {
+  while ! fetch_info $1; do
+    (( INFO_RC == 130 )) && return 1
+    local -a MENU_OPTS=()
+    menu "$CRUMB\n${ER}✗ 情報を取得できませんでした$R\n$(err_summary $SESS/info.err)" retry \
+      "retry${T}🔁 もう一度試す" \
+      "update${T}🔄 yt-dlp を更新して再試行" \
+      "cookie${T}🍪 Cookie を使って再試行(ログインが必要なとき)" \
+      "force${T}⏩ このままダウンロードしてみる" || return 1
+    case $REPLY in
+      retry) INFO_URL= ;;
+      cookie) setup_cookie && USE_COOKIE=1; INFO_URL= ;;
+      update) do_update; INFO_URL= ;;
+      force) return 0 ;;
+    esac
+  done
+}
+
+# ───────────────────────── 入力 ─────────────────────────
+
+get_url() { # [URL] → REPLY
+  if [[ -n $1 ]] && norm_url $1; then return 0; fi
+  local clip=$(clip_url) err= u=
+  if [[ -n $clip ]]; then
+    local -a MENU_OPTS=()
+    menu "$CRUMB\n${B}URL は？$R" clip \
+      "clip${T}📋 クリップボードの URL  $DM$(trunc $clip $(( COLS - 32 )))$R" \
+      "input${T}🔗 URL を入力する" || return 1
+    [[ $REPLY == clip ]] && { REPLY=$clip; return 0 }
+  fi
+  while true; do
+    ask "$CRUMB\n${B}URL を貼り付けてください$R ${DM}(右クリック / Ctrl+V · 動画 ID だけでも OK)$R${err:+\n$err}" \
+      "URL › " "$u" "https://www.youtube.com/watch?v=…" || return 1
+    u=$REPLY
+    if [[ -z $u ]]; then err="${WN}URL が空です$R"; continue; fi
+    norm_url $u && return 0
+    err="${ER}✗ URL として認識できません: $(trunc $u $(( COLS - 30 )))$R"
+  done
+}
+
+browse_dir() {
+  local sel
+  sel=$( { if (( $+commands[fd] )); then fd -t d -d 4 --exclude node_modules --exclude .cache --exclude .git . $HOME
+    else find $HOME -mindepth 1 -maxdepth 4 -type d \( -name node_modules -o -name '.*' \) -prune -o -type d -print; fi } 2>/dev/null |
+    sed "s|^$HOME|~|;s|/\$||" |
+    $FZF --prompt='📁 ' --header="${B}保存先のフォルダを検索$R" --footer="文字入力で絞り込み · Enter 決定 · Esc 戻る" \
+      --preview="$SELF __dir \$(eval print -r -- {})" --preview-window=$PVW) || return 1
+  REPLY=${sel/#\~/$HOME}
+}
+
+pick_dir() { # → OUTDIR
+  local -a cand items seen
+  cand=(${(f)"$(cat $RECENT 2>/dev/null)"} $HOME/Downloads)
+  [[ -d /mnt/c/Users/$USER/Downloads ]] && cand+=(/mnt/c/Users/$USER/Downloads)
+  cand+=($PWD)
+  local d note
+  for d in $cand; do
+    (( ${seen[(Ie)$d]} )) && continue
+    seen+=$d
+    note=
+    [[ $d == /mnt/c/* ]] && note=Windows
+    [[ $d == $PWD ]] && note="${note:+$note · }現在地"
+    [[ -d $d ]] || note="${note:+$note · }新規作成"
+    items+=("$d${T}📁 $(pad "$(trunc "$(tilde $d)" $(( COLS - 24 )))" $(( COLS - 22 )))$DM$note$R")
+  done
+  items+=("@browse${T}🔍 フォルダを探す…" "@input${T}📝 パスを入力…")
+  local -a MENU_OPTS=(--preview="$SELF __dir {1}" --preview-window=$PVW)
+  while true; do
+    menu "$CRUMB\n${B}保存先は？$R" ${seen[1]} $items || return 1
+    case $REPLY in
+      @browse) browse_dir || continue ;;
+      @input)
+        ask "$CRUMB\n${B}保存先のパス$R ${DM}(無ければ作成します)$R" "保存先 › " "$(tilde $PWD)/" || continue
+        REPLY=${REPLY/#\~/$HOME} ;;
+    esac
+    [[ -n $REPLY ]] || continue
+    if ! mkdir -p -- $REPLY 2>/dev/null; then
+      items=("${items[@]}"); continue
+    fi
+    OUTDIR=${REPLY:A}
+    save_recent $OUTDIR
+    return 0
+  done
+}
+
+# プレイリストの扱い → SCOPE / RANGE。プレイリストでなければ 2 を返す
+ask_scope() { # URL 本数
+  local url=$1 pc=$2
+  SCOPE=single RANGE=
+  [[ $url == *list=* || $pc == <-> ]] || return 2
+  local -a it
+  if [[ $url == *(v=|youtu.be/)* ]]; then
+    it=("single${T}▶  この動画だけ" "all${T}📃 プレイリスト全体${pc:+ ($pc 本)}" "range${T}✂  範囲を指定")
+  else
+    it=("all${T}📃 全部${pc:+ ($pc 本)}" "range${T}✂  範囲を指定")
+  fi
+  while true; do
+    menu "$CRUMB\n${B}プレイリストです。どこまで保存しますか？$R" single $it || return 1
+    SCOPE=$REPLY
+    [[ $SCOPE == range ]] || return 0
+    ask "$CRUMB\n${B}保存する番号$R ${DM}(例: 1-5  /  1,3,7  /  10-)$R" "範囲 › " "" "1-5" || continue
+    [[ -n $REPLY ]] && { RANGE=$REPLY; return 0 }
+  done
+}
+
+scope_args() {
+  case $SCOPE in
+    single) ARGS+=(--no-playlist -o '%(title).180B.%(ext)s') ;;
+    *) ARGS+=(--yes-playlist -o '%(playlist_title,playlist).100B/%(playlist_index)03d %(title).150B.%(ext)s')
+       [[ -n $RANGE ]] && ARGS+=(-I $RANGE) ;;
+  esac
+}
+
+video_args() { # 形式 画質
+  local res=res
+  [[ $2 == <-> ]] && res="res:$2"
+  case $1 in
+    mp4)  ARGS=(-S "$res,vcodec:h264,acodec:aac" --merge-output-format mp4) ;;
+    webm) ARGS=(-S "$res,vcodec:vp9,acodec:opus" --merge-output-format webm) ;;
+    *)    ARGS=(-S $res --merge-output-format mkv) ;;
+  esac
+}
+
+audio_args() { # 形式 音質
+  # 埋め込み用のカバー画像が保存先の同名 jpg を消さないよう、中間ファイルは別の場所に置く
+  ARGS=(-x --audio-format $1 -P "temp:$CACHE/tmp")
+  case $1 in
+    mp3|m4a) ARGS+=(--audio-quality ${2:-192}K) ;;
+    *) ARGS+=(--audio-quality 0) ;;
+  esac
+}
+
+image_args() { # 形式(空ならそのまま)
+  ARGS=(--write-thumbnail --skip-download --no-playlist -o '%(title).180B.%(ext)s')
+  [[ -n $1 ]] && ARGS+=(--convert-thumbnails $1)
+}
+
+# ───────────────────────── 追加オプション ─────────────────────────
+
+# 画像の投稿が主なサイト(gallery-dl を優先する)
+IMG_SITES='*(x.com|twitter.com|instagram.com|pixiv.net|pinterest.|imgur.com|reddit.com|bsky.app|tumblr.com|flickr.com|artstation.com|deviantart.com|fanbox.cc|misskey.|danbooru.|nijie.info|threads.net|/photo/)*'
+is_img_site() { [[ $1 == ${~IMG_SITES} ]] }
+
+opt_default() { # 種類 URL
+  case $1 in
+    video) print thumb,meta,chapters ;;
+    audio) print thumb,meta ;;
+    image) is_img_site $2 && (( $+commands[gallery-dl] )) && print gdl ;;
+  esac
+}
+
+# その形式で使えないオプション(webm と wav にはカバー画像を入れられない)
+opt_ok() { [[ $3 != thumb || $1/$2 != (video/webm|audio/wav) ]] }
+
+cookie_name() {
+  local c=${P[cookie]}
+  [[ $c == *:/* ]] && c=${c%%:*}
+  [[ $c == */* ]] && c=${c:t}
+  print -r -- ${c:-未設定}
+}
+
+opt_label() {
+  case $1 in
+    thumb) print サムネ埋め込み ;; thumbfile) print サムネ保存 ;;
+    subs) print "字幕埋め込み(${P[subl]:-ja.*,en.*})" ;; subfile) print 字幕ファイル ;; autosubs) print 自動字幕 ;;
+    chapters) print チャプター ;; meta) print メタデータ ;; sponsor) print SponsorBlock ;;
+    desc) print 説明文・情報 ;; archive) print 重複スキップ ;; rate) print "速度制限 ${P[rate]:-5M}/s" ;;
+    cookie) print "Cookie($(cookie_name))" ;; allthumbs) print 全サイズ ;; gdl) print gallery-dl 優先 ;;
+  esac
+}
+
+opt_items() { # 種類 形式
+  local k=$1 f=$2 w=24
+  local -a it
+  _oi() { it+=("$1${T}$2 $(pad $3 $w)$DM$4$R") }
+  case $k in
+    video)
+      opt_ok video $f thumb && _oi thumb 🌄 サムネイルを埋め込む "動画のカバー画像にする"
+      _oi thumbfile 📸 サムネイル画像も保存 "jpg で横に置く"
+      _oi subs 💬 字幕を埋め込む "${P[subl]:-ja.*,en.*} · 再生時に切り替え"
+      _oi subfile 💬 字幕ファイルも保存 "srt で横に置く"
+      _oi autosubs 🤖 自動生成の字幕も使う "字幕が無い動画向け"
+      _oi chapters 📑 チャプターを埋め込む "章ごとに飛ばせる"
+      _oi meta 🔖 メタデータを埋め込む "タイトル・投稿者・日付"
+      _oi sponsor ⏩ スポンサー区間を削除 "SponsorBlock (YouTube)" ;;
+    audio)
+      opt_ok audio $f thumb && _oi thumb 🌄 カバー画像を埋め込む "サムネイルを正方形にして"
+      _oi thumbfile 📸 サムネイル画像も保存 "jpg で横に置く"
+      _oi meta 🔖 タグを書き込む "曲名・アーティストなど"
+      _oi chapters 📑 チャプターを埋め込む "m4a · opus など"
+      _oi sponsor ⏩ スポンサー区間を削除 "SponsorBlock (YouTube)" ;;
+    image)
+      _oi allthumbs 📸 全サイズを保存 "サムネイルを解像度ごとに"
+      if (( $+commands[gallery-dl] )); then _oi gdl 📦 "gallery-dl を優先" "X・Instagram・pixiv などの投稿"; fi ;;
+  esac
+  _oi desc 📝 説明文・情報も保存 ".description / .info.json"
+  [[ $k != image ]] && _oi archive 📚 保存済みはスキップ "同じ動画を二度落とさない"
+  _oi rate 🐢 速度を制限 "${P[rate]:-5M}/秒"
+  _oi cookie 🍪 "Cookie を使う" "ログインが必要なサイト向け ($(cookie_name))"
+  print -rl -- $it
+}
+
+# 選んだオプションに追加の入力が要るもの。Esc なら 1
+opt_extras() {
+  if (( ${cur[(Ie)subs]} || ${cur[(Ie)subfile]} || ${cur[(Ie)autosubs]} )); then
+    ask "$CRUMB\n${B}字幕の言語$R ${DM}(カンマ区切り · 例: ja,en / ja.*,en.* / all)$R" "言語 › " "${P[subl]:-ja.*,en.*}" || return 1
+    [[ -n $REPLY ]] && save_pref subl ${REPLY// /}
+  fi
+  if (( ${cur[(Ie)rate]} )); then
+    local e=
+    while true; do
+      ask "$CRUMB\n${B}1 秒あたりの上限$R ${DM}(例: 500K / 5M)$R${e:+\n$e}" "速度 › " "${P[rate]:-5M}" || return 1
+      [[ $REPLY == [0-9.]##[KkMmGg]# ]] && { save_pref rate $REPLY; break }
+      e="${ER}✗ 数字 + K / M で指定してください$R"
+    done
+  fi
+  if (( ${cur[(Ie)cookie]} )); then
+    if [[ -z ${P[cookie]} || ( ${P[cookie]} == */* && ${P[cookie]} != *:/* && ! -f ${P[cookie]} ) ]]; then
+      setup_cookie || return 1
+    fi
+    USE_COOKIE=1
+  fi
+  return 0
+}
+
+pick_opts() { # 種類 形式 URL → OPTS
+  local kind=$1 fmt=$2 url=$3 sel i
+  local -a it cur binds out
+  it=("${(@f)$(opt_items $kind $fmt)}")
+  if [[ $OPTS_KIND == $kind ]]; then
+    cur=($OPTS)
+  else
+    cur=(${(s:,:)${P[opt_$kind]-$(opt_default $kind $url)}})
+    if [[ $kind == image ]]; then
+      cur=(${cur:#gdl}); [[ -n $(opt_default image $url) ]] && cur+=gdl
+    fi
+    (( USE_COOKIE )) && cur+=cookie
+  fi
+  while true; do
+    binds=()
+    for (( i = 1; i <= $#it; i++ )); do (( ${cur[(Ie)${it[i]%%$T*}]} )) && binds+="pos($i)+select"; done
+    binds+="pos(1)"
+    # 何も選ばずに Enter でも「なし」になるよう、決定は最後の行に移ってから確定する
+    sel=$(print -rl -- $it "@ok${T}$OK✔ この内容で決定$R" | $FZF --multi --no-input --delimiter=$T --with-nth=2.. \
+      --header="${CRUMB//\\n/$'\n'}"$'\n'"${B}追加オプション$R ${DM}(いくつでも選べます)$R" \
+      --footer="Space 切替 · Enter 決定 · Esc 戻る" \
+      --bind="load:${(j:+:)binds}" --bind='space:toggle,j:down,k:up,q:abort,enter:last+accept') || return 1
+    out=(${(f)sel}); out=(${out%%$T*}); cur=(${out:#@ok})
+    opt_extras && break
+  done
+  OPTS=($cur) OPTS_KIND=$kind
+  # この形式で出さなかった項目の設定は残す
+  local -a keep=(${(s:,:)${P[opt_$kind]-$(opt_default $kind $url)}}) shown=(${it%%$T*})
+  keep=(${keep:|shown})
+  save_pref opt_$kind ${(j:,:)${(u)${cur:#gdl}}}${keep:+,${(j:,:)keep}}
+}
+
+setup_cookie() { # → P[cookie]
+  local -a it ff
+  local note= e=
+  (( WSL )) && ff=(/mnt/c/Users/*/AppData/Roaming/Mozilla/Firefox/Profiles/*(N/om))
+  [[ -n ${P[cookie]} ]] && it+=("keep${T}✓  今の設定のまま  $DM$(cookie_name)$R")
+  it+=("file${T}📄 cookies.txt を使う  ${DM}ブラウザ拡張で書き出したもの$R")
+  (( $#ff )) && it+=("wff${T}🦊 Windows の Firefox  $DM${ff[1]:t}$R")
+  it+=("firefox${T}🦊 Firefox" "chrome${T}🌐 Chrome" "chromium${T}🌐 Chromium" "edge${T}🌐 Edge" "brave${T}🦁 Brave")
+  (( WSL )) && note="\n${DM}WSL からは Windows の Chrome / Edge の Cookie は読めません(Firefox か cookies.txt を使ってください)$R"
+  local -a MENU_OPTS=()
+  while true; do
+    menu "$CRUMB\n${B}Cookie をどこから読みますか？$R$note" ${${P[cookie]:+keep}:-file} $it || return 1
+    case $REPLY in
+      keep) return 0 ;;
+      wff) save_pref cookie "firefox:$ff[1]"; return 0 ;;
+      file)
+        while true; do
+          ask "$CRUMB\n${B}cookies.txt のパス$R ${DM}(Netscape 形式)$R${e:+\n$e}" "ファイル › " "$(tilde ${${P[cookie]:#*:*}:-$CONF/cookies.txt})" || break
+          REPLY=${REPLY/#\~/$HOME}
+          [[ -f $REPLY ]] && { save_pref cookie ${REPLY:A}; return 0 }
+          e="${ER}✗ ファイルがありません: $(tilde $REPLY)$R"
+        done ;;
+      *) save_pref cookie $REPLY; return 0 ;;
+    esac
+  done
+}
+
+cookie_args() {
+  local c=${P[cookie]}
+  [[ -z $c ]] && return
+  if [[ -f $c ]]; then print -rl -- --cookies $c; else print -rl -- --cookies-from-browser $c; fi
+}
+
+opt_args() { # 種類 形式 → ARGS に追加
+  local k=$1 f=$2 o subs=0
+  for o in $OPTS; do
+    opt_ok $k $f $o || continue
+    case $o in
+      thumb)
+        [[ $k == image ]] && continue
+        ARGS+=(--embed-thumbnail --convert-thumbnails jpg)
+        # 音声のカバー画像は正方形に切り抜く
+        [[ $k == audio ]] && ARGS+=(--ppa "ThumbnailsConvertor+FFmpeg_o:-c:v mjpeg -vf crop=\"'if(gt(ih,iw),iw,ih)':'if(gt(iw,ih),ih,iw)'\"") ;;
+      thumbfile) [[ $k != image ]] && ARGS+=(--write-thumbnail --convert-thumbnails jpg) ;;
+      subs) [[ $k == video ]] && { ARGS+=(--embed-subs); subs=1 } ;;
+      subfile) [[ $k == video ]] && { ARGS+=(--write-subs); [[ $f != webm ]] && ARGS+=(--convert-subs srt); subs=1 } ;;
+      autosubs) [[ $k == video ]] && { ARGS+=(--write-auto-subs); subs=1 } ;;
+      chapters) [[ $k != image ]] && ARGS+=(--embed-chapters) ;;
+      meta) [[ $k != image ]] && ARGS+=(--embed-metadata) ;;
+      sponsor) [[ $k != image ]] && ARGS+=(--sponsorblock-remove sponsor,selfpromo,interaction) ;;
+      desc) ARGS+=(--write-info-json); [[ $k != image ]] && ARGS+=(--write-description) ;;
+      archive) ARGS+=(--download-archive $CONF/archive.txt) ;;
+      rate) ARGS+=(-r ${P[rate]:-5M}) ;;
+      cookie) ARGS+=(${(f)"$(cookie_args)"}) ;;
+      allthumbs) [[ $k == image ]] && ARGS+=(--write-all-thumbnails) ;;
+    esac
+  done
+  (( subs )) && ARGS+=(--sub-langs "${P[subl]:-ja.*,en.*},-live_chat")
+}
+
+gdl_args() { # → GARGS
+  GARGS=(-D $OUTDIR)
+  (( ${OPTS[(Ie)desc]} )) && GARGS+=(--write-metadata)
+  (( ${OPTS[(Ie)rate]} )) && GARGS+=(-r ${P[rate]:-5M})
+  (( ${OPTS[(Ie)cookie]} )) && GARGS+=(${(f)"$(cookie_args)"})
+}
+
+# ───────────────────────── 確認画面 ─────────────────────────
+
+# → REPLY: start / fmt / opts / scope / dir / cookie / menu。Esc なら 1
+confirm() { # 種類 URL 形式 形式の説明 プレイリストか
+  local kind=$1 url=$2 fmt=$3 fl=$4 ispl=$5 msg= o cmd
+  local -a ol=() it
+  for o in $OPTS; do opt_ok $kind $fmt $o && ol+=("$(opt_label $o)"); done
+  if [[ $kind == image ]] && (( ${OPTS[(Ie)gdl]} )); then
+    cmd="gallery-dl ${(j: :)${(@q-)GARGS}} -- ${(q-)url}"
+  else
+    cmd="yt-dlp ${(j: :)${(@q-)ARGS}} -P ${(q-)OUTDIR} -- ${(q-)url}"
+  fi
+  local L=$(( COLS - 18 )) head
+  head="$CRUMB\n${B}この内容でダウンロードしますか？$R\n"
+  head+="\n  ${DM}$(pad タイトル 11)$R$(trunc "${TITLE:-$url}" $L)"
+  head+="\n  ${DM}$(pad 形式 11)$R$fl"
+  (( ispl )) && [[ $SCOPE != single ]] && head+="\n  ${DM}$(pad 範囲 11)$R${RANGE:-全部}"
+  head+="\n  ${DM}$(pad オプション 11)$R$(trunc "${(j: · :)ol:-なし}" $L)"
+  head+="\n  ${DM}$(pad 保存先 11)$R$(tilde $OUTDIR)"
+  it=("start${T}$OK🚀 ダウンロード開始$R" "opts${T}🔧 オプションを変更")
+  if (( IN_BATCH )); then it+=("fmt${T}🎨 動画 / 音声を変更")
+  elif [[ $kind == image ]]; then it+=("fmt${T}🎨 形式を変更")
+  else it+=("fmt${T}🎨 形式・画質を変更"); fi
+  (( ispl )) && it+=("scope${T}📃 範囲を変更")
+  (( ${OPTS[(Ie)cookie]} )) && it+=("cookie${T}🍪 Cookie の読み込み元を変更")
+  it+=("dir${T}📁 保存先を変更" "cmd${T}📋 コマンドをコピー" "menu${T}🏠 やめてメニューへ")
+  local -a MENU_OPTS=()
+  while true; do
+    menu "$head${msg:+\n\n$msg}" start $it || return 1
+    [[ $REPLY == cmd ]] || return 0
+    copy_text $cmd
+    msg="$OK✓$R コピーしました\n$DM$(print -r -- $cmd | fold -w $(( COLS - 8 )) | head -4)$R"
+  done
+}
+
+# ステップを進める(確認画面から来たときは確認画面に戻る)
+go() { step=${JUMP:-$1} }
+
+# ───────────────────────── ダウンロード ─────────────────────────
+
+render_progress() {
+  local line lab p fill cur= fin= lastidx= open= bw
+  local -a x
+  # 折り返すと \r で上書きできなくなるので、必ず 1 行に収める
+  bw=$(( COLS - 58 )); (( bw > 30 )) && bw=30; (( bw < 6 )) && bw=6
+  local tw=$(( COLS - bw - 20 ))
+  nl() { [[ -n $open ]] && print; open= }
+  while IFS= read -r line; do
+    case $line in
+      YDP\|*)
+        x=("${(@s:|:)line}")
+        local pct=${x[2]// /} spd=${x[3]// /} eta=${x[4]// /} tot=${x[5]// /} vc=$x[6] ac=$x[7]
+        local idx=$x[8] cnt=$x[9] ttl=${(j:|:)x[10,-1]}
+        if [[ $idx == <-> && $idx != $lastidx ]]; then
+          lastidx=$idx fin=
+          nl
+          print -r -- "  $A[$idx/${cnt:-?}]$R $(trunc $ttl $(( COLS - 14 )))"
+        fi
+        if [[ $vc == none ]]; then lab=音声; elif [[ $ac == none ]]; then lab=映像; else lab=データ; fi
+        [[ $lab == $fin ]] && continue
+        p=${${pct%\%}%%.*}; [[ $p == <-> ]] || p=0; (( p > 100 )) && p=100
+        [[ $tot == (NA|N/A|Unknown*) ]] && tot=
+        [[ $spd == (NA|N/A|Unknown*) ]] && spd=
+        [[ $eta == (NA|N/A|Unknown*) ]] && eta=
+        if (( p >= 100 )); then
+          printf '\r\e[2K    %s✓%s %s %s%s%s\n' $OK $R "$(pad $lab 6)" $DM "$tot" $R
+          fin=$lab open=
+        else
+          fill=$(( p * bw / 100 ))
+          printf '\r\e[2K    %s %s%s%s%s%s %4s  %s%s%s' "$(pad $lab 6)" \
+            $A "${(l:$fill::█:)}" $DM "${(l:$(( bw - fill ))::░:)}" $R "$p%" \
+            $DM "$(trunc "$tot${spd:+ · $spd}${eta:+ · 残り $eta}" $tw)" $R
+          open=bar
+        fi ;;
+      YDPP\|*)
+        x=("${(@s:|:)line}")
+        local lbl=
+        case $x[2] in
+          Merger) lbl="映像と音声を結合" ;;
+          ExtractAudio) lbl="音声を変換" ;;
+          EmbedThumbnail) lbl="カバー画像を埋め込み" ;;
+          Metadata) lbl="タグを書き込み" ;;
+          VideoConvertor|VideoRemuxer) lbl="動画を変換" ;;
+          *) continue ;;
+        esac
+        if [[ $x[3] == started ]]; then
+          nl; printf '    %s⋯%s %s…' $A $R $lbl; open=pp
+        else
+          [[ $open == pp ]] || nl
+          printf '\r\e[2K    %s✓%s %s\n' $OK $R $lbl; open=
+        fi ;;
+      ERROR:*)
+        (( INTR )) && continue
+        nl; print -r -- "    $ER✗ $(trunc "${line#ERROR: }" $(( COLS - 8 )))$R" ;;
+    esac
+  done
+  nl
+}
+
+run_dl() { # 保存先 URL yt-dlp の追加引数...
+  local outdir=$1 url=$2; shift 2
+  : > $SESS/paths; : > $SESS/run.log; touch $SESS/mark
+  print
+  print -r -- "  $A▼$R $B$(trunc "${TITLE:-$url}" $(( COLS - 6 )))$R"
+  print -r -- "    $DM→ $(tilde $outdir)$R"
+  INTR=0
+  local t0=$EPOCHREALTIME
+  tput civis
+  yt-dlp -q --progress --newline --no-mtime \
+    --progress-template 'download:YDP|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress._total_bytes_str,progress._total_bytes_estimate_str)s|%(info.vcodec)s|%(info.acodec)s|%(info.playlist_index)s|%(info.playlist_count)s|%(info.title)s' \
+    --progress-template 'postprocess:YDPP|%(progress.postprocessor)s|%(progress.status)s' \
+    --print-to-file after_move:filepath $SESS/paths \
+    -P $outdir "$@" -- $url 2>&1 | tee -a $SESS/run.log | render_progress
+  local rc=${pipestatus[1]}
+  tput cnorm
+  ELAPSED=$(( EPOCHREALTIME - t0 ))
+  { print -r -- "=== $(date '+%F %T') $url"; print -r -- "yt-dlp -P $outdir $*"; cat $SESS/run.log } >> $LOG
+  FILES=()
+  local f
+  for f in ${(f)"$(<$SESS/paths)"}; do [[ -f $f ]] && (( ! ${FILES[(Ie)$f]} )) && FILES+=$f; done
+  # サムネイル・字幕・説明文など、同じ名前で横に置かれたファイルも並べる
+  local g
+  for f in $FILES; do
+    for g in ${~${(b)f:r}}.*(N.); do
+      [[ $g -nt $SESS/mark && $g != *.part ]] && (( ! ${FILES[(Ie)$g]} )) && FILES+=$g
+    done
+  done
+  (( INTR )) && return 130
+  (( rc == 0 || $#FILES )) && return 0
+  return 1
+}
+
+# 失敗・中止したとき。0 を返したらやり直す(REPLY=update なら更新してから)
+fail_menu() { # 終了コード
+  local head
+  local -a it
+  if (( $1 == 130 )); then
+    head="$WN⏹ 中止しました$R  ${DM}「再開」で続きから落とせます$R"
+    it=("retry${T}▶  再開する")
+  else
+    head="$ER✗ ダウンロードに失敗しました$R\n$(err_summary $SESS/run.log)"
+    it=("retry${T}🔁 もう一度試す" "update${T}🔄 yt-dlp を更新して再試行" "cookie${T}🍪 Cookie を使って再試行")
+  fi
+  it+=("log${T}📜 ログを見る" "menu${T}🏠 メニューに戻る")
+  local -a MENU_OPTS=()
+  while true; do
+    menu "$CRUMB\n$head" retry $it || return 1
+    case $REPLY in
+      log) less -R +G $SESS/run.log ;;
+      menu) return 1 ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+download() { # 種類 URL 引数...
+  local kind=$1 url=$2 rc; shift 2
+  local -a a=("$@")
+  while true; do
+    run_dl $OUTDIR $url $a; rc=$?
+    if (( rc == 0 )); then
+      add_history $kind
+      RES_NOTE=
+      show_results
+      return 0
+    fi
+    fail_menu $rc || { NEXT=menu; return 0 }
+    case $REPLY in
+      update) do_update ;;
+      cookie)
+        setup_cookie || continue
+        USE_COOKIE=1
+        local -a b=(); local i
+        for (( i = 1; i <= $#a; i++ )); do
+          [[ $a[i] == --cookies(|-from-browser) ]] && { (( i++ )); continue }
+          b+=$a[i]
+        done
+        a=($b ${(f)"$(cookie_args)"}) ;;
+    esac
+  done
+}
+
+do_update() {
+  print
+  print -r -- "  $A🔄 yt-dlp を更新しています…$R"
+  local out rc
+  out=$(yt-dlp -U 2>&1); rc=$?
+  print -rl -- "    $DM"${^${(f)out}}"$R"
+  if (( rc != 0 )) && [[ $out == *(ermission|denied)* ]]; then
+    print -r -- "  ${DM}権限が必要なので sudo で実行します$R"
+    sudo yt-dlp -U; rc=$?
+  fi
+  command rm -f $CACHE/version
+  if (( rc == 0 )); then print -r -- "  $OK✓ yt-dlp $(yt_version)$R"
+  else print -r -- "  $ER✗ 更新できませんでした$R"; fi
+}
+
+yt_version() {
+  local f=$CACHE/version
+  local -a fresh=($f(N.mh-12))
+  (( $#fresh )) || yt-dlp --version > $f 2>/dev/null
+  print -r -- "$(<$f)"
+}
+
+# ───────────────────────── 結果・履歴 ─────────────────────────
+
+file_actions() { # ファイル → REPLY_MSG
+  local f=$1 k=$(file_kind $1)
+  REPLY_MSG=
+  local -a it
+  case $k in
+    video) it=("open${T}▶  再生する") ;;
+    audio) it=("open${T}▶  再生する(既定のアプリ)" "play${T}🎧 ここで再生(ffplay)") ;;
+    *) it=("open${T}👀 開く") ;;
+  esac
+  if (( WSL )); then
+    it+=("reveal${T}📂 エクスプローラーで表示" "copyw${T}📋 パスをコピー(Windows 形式)" "copyl${T}📋 パスをコピー(WSL 形式)")
+  else
+    it+=("reveal${T}📂 フォルダで表示" "copyl${T}📋 パスをコピー")
+  fi
+  it+=("delete${T}❌ 削除する")
+  # どの項目を選んでいてもこのファイルを表示する
+  local -a MENU_OPTS=(--preview="$SELF __preview ${(q)f}" --preview-window=$PVW)
+  menu "$(kind_icon $f) $B$(trunc ${f:t} $(( COLS - 8 )))$R" open $it || return 0
+  case $REPLY in
+    open) open_path $f; REPLY_MSG="$OK✓$R 開きました: ${f:t}" ;;
+    play)
+      print -r -- "\n  🎧 $B${f:t}$R  ${DM}Ctrl+C で停止$R"
+      INTR=0; ffplay -nodisp -autoexit -loglevel quiet -- $f; INTR=0 ;;
+    reveal) reveal_path $f ;;
+    copyw) copy_text "$(wslpath -w $f)"; REPLY_MSG="$OK✓$R コピーしました: $(wslpath -w $f)" ;;
+    copyl) copy_text $f; REPLY_MSG="$OK✓$R コピーしました: $f" ;;
+    delete)
+      MENU_OPTS=()
+      menu "$ER本当に削除しますか？$R\n${f:t}" no "no${T}やめる" "yes${T}❌ 削除する" || return 0
+      if [[ $REPLY == yes ]] && command rm -f -- $f; then
+        FILES=(${FILES:#$f})
+        REPLY_MSG="$WN✓$R 削除しました: ${f:t}"
+      fi ;;
+  esac
+}
+
+show_results() { # FILES / ELAPSED / OUTDIR / RES_NOTE を表示
+  local msg= f total=0
+  for f in $FILES; do (( total += $(stat -c %s -- $f 2>/dev/null || print 0) )); done
+  NEXT=menu
+  while true; do
+    local -a it=()
+    for f in $FILES; do
+      it+=("$f${T}$(kind_icon $f) $(pad "$(trunc ${f:t} $(( COLS - 22 )))" $(( COLS - 20 )))$DM$(human $(stat -c %s -- $f 2>/dev/null))$R")
+    done
+    (( $#FILES )) || it+=("@none${T}${DM}(新しいファイルはありません · 既に保存済みかもしれません)$R")
+    [[ -n $FAILED_URLS ]] && it+=("@copyfail${T}📋 失敗した URL をコピー")
+    it+=("@folder${T}📂 保存先を開く" "@again${T}➕ 続けてダウンロード" "@menu${T}🏠 メニューに戻る" "@quit${T}👋 終了")
+    local head="$OK${B}✓ 完了$R  $#FILES 件 · $(human $total) · $(fmt_dur $ELAPSED)  $DM→ $(tilde $OUTDIR)$R"
+    [[ -n $RES_NOTE ]] && head+="\n$RES_NOTE"
+    [[ -n $msg ]] && head+="\n$msg"
+    msg=
+    local -a MENU_OPTS=(--preview="$SELF __preview {1}" --preview-window=$PVW)
+    menu "$head" ${FILES[1]:-@again} $it || return 0
+    case $REPLY in
+      @none) ;;
+      @folder) open_dir $OUTDIR ;;
+      @again) NEXT=again; return 0 ;;
+      @menu) NEXT=menu; return 0 ;;
+      @quit) NEXT=quit; return 0 ;;
+      @copyfail) copy_text "$FAILED_URLS"; msg="$OK✓$R 失敗した URL をコピーしました" ;;
+      *) file_actions $REPLY; msg=$REPLY_MSG ;;
+    esac
+  done
+}
+
+history_menu() {
+  local msg=
+  while true; do
+    if [[ ! -s $HIST ]]; then
+      local -a MENU_OPTS=()
+      menu "${A}🕘 履歴$R\n${DM}まだダウンロードしたファイルはありません$R" back "back${T}←  戻る"
+      return 0
+    fi
+    local -a it seen
+    local line ts f mark
+    it=() seen=()
+    for line in ${(Oaf)"$(<$HIST)"}; do
+      ts=${line%%$T*} f=${line##*$T}
+      (( ${seen[(Ie)$f]} )) && continue
+      seen+=$f
+      mark=; [[ -e $f ]] || mark=" $ER(削除済み)$R"
+      it+=("$f${T}$DM$(strftime '%m/%d %H:%M' $ts)$R  $(kind_icon $f) $(trunc ${f:t} $(( COLS - 26 )))$mark")
+      (( $#it >= 150 )) && break
+    done
+    local -a MENU_OPTS=(--preview="$SELF __preview {1}" --preview-window=$PVW)
+    local MENU_SEARCH=1
+    menu "${A}🕘 履歴$R  ${DM}新しい順 · $#it 件$R${msg:+\n$msg}" "" $it || return 0
+    msg=
+    [[ -e $REPLY ]] || { msg="${WN}そのファイルはもうありません$R"; continue }
+    MENU_SEARCH=0
+    local FILES=($REPLY)
+    file_actions $REPLY; msg=$REPLY_MSG
+  done
+}
+
+# ───────────────────────── 各モード ─────────────────────────
+
+dl_video() {
+  local CRUMB url fmt q step=1 maxh pc ispl=0 JUMP=
+  local -a OPTS; local OPTS_KIND=
+  get_url "$1" || return 1; url=$REPLY
+  need_info $url || return 1
+  maxh=$(info_field 6); [[ $maxh == <-> ]] || maxh=0
+  pc=$(info_field 9); [[ $pc == <-> ]] || pc=
+  [[ $url == *list=* || -n $pc ]] && ispl=1
+  local -a MENU_OPTS=(--preview="$SELF __card $SESS/info $SESS/thumb.jpg" --preview-window=$PVW)
+  local sep=" $DM›$R " base="$A🎬 動画$R"
+  SCOPE=single RANGE=
+  while true; do
+    CRUMB=$base
+    (( step > 1 )) && CRUMB+="$sep$fmt"
+    (( step > 2 )) && CRUMB+="$sep$(qname $q)"
+    (( step > 3 )) && [[ $SCOPE != single ]] && CRUMB+="$sep${RANGE:-全部}"
+    case $step in
+      1) menu "$CRUMB\n${B}形式は？$R" ${fmt:-${P[vfmt]:-mp4}} \
+           "mp4${T}$(pad mp4 7)${DM}おすすめ · どの端末・アプリでも再生できる$R" \
+           "mkv${T}$(pad mkv 7)${DM}元の画質・音質そのまま$R" \
+           "webm${T}$(pad webm 7)${DM}VP9 + Opus$R" || { [[ -n $JUMP ]] && { step=$JUMP; continue }; return 1 }
+         fmt=$REPLY step=2 ;;
+      2) local bl=; (( maxh )) && bl="${maxh}p"
+         local -a qi=("best${T}$(pad 最高画質 10)$DM$bl$R")
+         local h
+         for h in 2160 1440 1080 720 480 360; do
+           (( maxh && h >= maxh )) && continue
+           qi+=("$h${T}$(pad ${h}p 10)$DM$(qlabel $h)$R")
+         done
+         local dq=${q:-${P[vq]:-best}}
+         (( ${qi[(I)$dq$T*]} )) || dq=best
+         menu "$CRUMB\n${B}画質は？$R" $dq $qi || { step=1; continue }
+         q=$REPLY; go 3 ;;
+      3) ask_scope $url "$pc"
+         (( $? == 1 )) && { step=2; continue }
+         go 4 ;;
+      4) pick_opts video $fmt $url || { (( ispl )) && step=3 || step=2; continue }
+         go 5 ;;
+      5) pick_dir || { go 4; continue }
+         step=6 ;;
+      6) JUMP=6
+         video_args $fmt $q; opt_args video $fmt; scope_args
+         confirm video $url $fmt "$fmt · $(qname $q)" $ispl || { JUMP= step=5; continue }
+         case $REPLY in
+           start) break ;;
+           fmt) step=1 ;; opts) step=4 ;; scope) step=3 ;; dir) step=5 ;;
+           cookie) setup_cookie ;;
+           menu) NEXT=menu; return 0 ;;
+         esac ;;
+    esac
+  done
+  save_pref vfmt $fmt; save_pref vq $q
+  CRUMB+="$sep$(tilde $OUTDIR)"
+  download video $url $ARGS
+}
+
+dl_audio() {
+  local CRUMB url fmt q= step=1 pc ispl=0 JUMP=
+  local -a OPTS; local OPTS_KIND=
+  get_url "$1" || return 1; url=$REPLY
+  need_info $url || return 1
+  pc=$(info_field 9); [[ $pc == <-> ]] || pc=
+  [[ $url == *list=* || -n $pc ]] && ispl=1
+  local -a MENU_OPTS=(--preview="$SELF __card $SESS/info $SESS/thumb.jpg" --preview-window=$PVW)
+  local sep=" $DM›$R " base="$A🎵 音声$R"
+  SCOPE=single RANGE=
+  while true; do
+    CRUMB=$base
+    (( step > 1 )) && CRUMB+="$sep$fmt"
+    (( step > 2 )) && [[ -n $q ]] && CRUMB+="$sep${q}kbps"
+    (( step > 3 )) && [[ $SCOPE != single ]] && CRUMB+="$sep${RANGE:-全部}"
+    case $step in
+      1) menu "$CRUMB\n${B}形式は？$R" ${fmt:-${P[afmt]:-mp3}} \
+           "mp3${T}$(pad mp3 7)${DM}おすすめ · どこでも再生できる$R" \
+           "m4a${T}$(pad m4a 7)${DM}AAC · iPhone / iTunes 向け$R" \
+           "opus${T}$(pad opus 7)${DM}元の音声そのまま · 軽くて高音質$R" \
+           "flac${T}$(pad flac 7)${DM}ロスレス(容量大)$R" \
+           "wav${T}$(pad wav 7)${DM}無圧縮 · 編集向け$R" || { [[ -n $JUMP ]] && { step=$JUMP; continue }; return 1 }
+         fmt=$REPLY step=2 ;;
+      2) if [[ $fmt != (mp3|m4a) ]]; then q=; go 3; continue; fi
+         menu "$CRUMB\n${B}音質は？$R" ${q:-${P[aq]:-192}} \
+           "320${T}$(pad 320kbps 10)${DM}最高音質$R" \
+           "256${T}$(pad 256kbps 10)${DM}高音質$R" \
+           "192${T}$(pad 192kbps 10)${DM}標準$R" \
+           "128${T}$(pad 128kbps 10)${DM}軽量$R" || { step=1; continue }
+         q=$REPLY; go 3 ;;
+      3) ask_scope $url "$pc"
+         (( $? == 1 )) && { [[ -n $q ]] && step=2 || step=1; continue }
+         go 4 ;;
+      4) pick_opts audio $fmt $url || {
+           if (( ispl )); then step=3; elif [[ -n $q ]]; then step=2; else step=1; fi; continue }
+         go 5 ;;
+      5) pick_dir || { go 4; continue }
+         step=6 ;;
+      6) JUMP=6
+         audio_args $fmt $q; opt_args audio $fmt; scope_args
+         confirm audio $url $fmt "$fmt${q:+ · ${q}kbps}" $ispl || { JUMP= step=5; continue }
+         case $REPLY in
+           start) break ;;
+           fmt) step=1 ;; opts) step=4 ;; scope) step=3 ;; dir) step=5 ;;
+           cookie) setup_cookie ;;
+           menu) NEXT=menu; return 0 ;;
+         esac ;;
+    esac
+  done
+  save_pref afmt $fmt; [[ -n $q ]] && save_pref aq $q
+  CRUMB+="$sep$(tilde $OUTDIR)"
+  download audio $url $ARGS
+}
+
+img_job() { yt-dlp --no-warnings $ARGS -P $OUTDIR -- $1 >> $SESS/run.log 2>&1 }
+gdl_job() { gallery-dl $GARGS -- $1 >> $SESS/run.log 2>&1 }
+
+dl_image() {
+  local CRUMB url fmt step=1 JUMP= sep=" $DM›$R " base="$A📷 画像$R"
+  local -a OPTS GARGS; local OPTS_KIND=
+  get_url "$1" || return 1; url=$REPLY
+  fetch_info $url   # 画像の投稿は yt-dlp で情報が取れないことが多いので失敗しても続ける
+  (( INFO_RC == 130 )) && return 1
+  local -a MENU_OPTS=(--preview="$SELF __card $SESS/info $SESS/thumb.jpg" --preview-window=$PVW)
+  while true; do
+    CRUMB=$base
+    (( step > 1 )) && CRUMB+="$sep${fmt/orig/そのまま}"
+    case $step in
+      1) local hint=
+         is_img_site $url && (( ! $+commands[gallery-dl] )) &&
+           hint="\n${WN}💡 画像の投稿は gallery-dl があると取れます(pipx install gallery-dl)$R"
+         menu "$CRUMB\n${B}形式は？$R$hint" ${fmt:-${P[ifmt]:-orig}} \
+           "orig${T}$(pad そのまま 10)${DM}元の形式(webp のことが多い)$R" \
+           "jpg${T}$(pad jpg 10)${DM}どこでも開ける$R" \
+           "png${T}$(pad png 10)${DM}劣化なし$R" || { [[ -n $JUMP ]] && { step=$JUMP; continue }; return 1 }
+         fmt=$REPLY; go 2 ;;
+      2) pick_opts image $fmt $url || { step=1; continue }
+         go 3 ;;
+      3) pick_dir || { go 2; continue }
+         step=4 ;;
+      4) JUMP=4
+         image_args ${fmt:#orig}; opt_args image $fmt; gdl_args
+         confirm image $url $fmt "${fmt/orig/そのまま}" 0 || { JUMP= step=3; continue }
+         case $REPLY in
+           start) break ;;
+           fmt) step=1 ;; opts) step=2 ;; dir) step=3 ;;
+           cookie) setup_cookie ;;
+           menu) NEXT=menu; return 0 ;;
+         esac ;;
+    esac
+  done
+  save_pref ifmt $fmt
+  [[ $fmt == orig ]] && fmt=
+  CRUMB+="$sep$(tilde $OUTDIR)"
+  local gdl=$(( ${OPTS[(Ie)gdl]} && $+commands[gallery-dl] ))
+
+  while true; do
+    : > $SESS/run.log
+    print
+    print -r -- "  $A▼$R $B$(trunc "${TITLE:-$url}" $(( COLS - 6 )))$R"
+    print -r -- "    $DM→ $(tilde $OUTDIR)$R"
+    touch $SESS/mark
+    local t0=$EPOCHREALTIME rc
+    if (( gdl )); then
+      spin "gallery-dl で取得しています…" gdl_job $url; rc=$?
+      if (( rc != 0 && rc != 130 )); then
+        print -r -- "    ${DM}gallery-dl では取れなかったので yt-dlp で試します$R"
+        spin "yt-dlp で取得しています…" img_job $url; rc=$?
+      fi
+    else
+      spin "画像を取得しています…" img_job $url; rc=$?
+      if (( rc != 0 && rc != 130 )) && (( $+commands[gallery-dl] )); then
+        print -r -- "    ${DM}yt-dlp では取れなかったので gallery-dl で試します$R"
+        spin "gallery-dl で取得しています…" gdl_job $url; rc=$?
+      fi
+    fi
+    ELAPSED=$(( EPOCHREALTIME - t0 ))
+    { print -r -- "=== $(date '+%F %T') [image] $url"; cat $SESS/run.log } >> $LOG
+    FILES=(${(f)"$(find $OUTDIR -type f -newer $SESS/mark 2>/dev/null)"})
+    FILES=(${(M)FILES:#*.(#i)(jpg|jpeg|png|webp|gif|bmp|avif|mp4|webm|mov)})
+    if [[ -n $fmt ]]; then
+      local f new; local -a conv=()
+      for f in $FILES; do
+        if [[ $(file_kind $f) == image && ${f:e:l} != $fmt && ${f:e:l} != gif ]]; then
+          new=${f:r}.$fmt
+          ffmpeg -v error -y -i $f $new </dev/null 2>>$LOG && command rm -f -- $f && f=$new
+        fi
+        conv+=$f
+      done
+      FILES=($conv)
+    fi
+    if (( $#FILES )); then
+      print -r -- "    $OK✓$R $#FILES 件"
+      add_history image; RES_NOTE=; show_results; return 0
+    fi
+    (( rc == 0 )) && rc=1
+    fail_menu $rc || { NEXT=menu; return 0 }
+    case $REPLY in
+      update) do_update ;;
+      cookie) setup_cookie && { OPTS+=(cookie); USE_COOKIE=1; gdl_args; image_args $fmt; opt_args image ${fmt:-orig} } ;;
+    esac
+  done
+}
+
+batch_input() { # → URLS
+  local -a MENU_OPTS=() it
+  local cu=(${(f)"$(clip_text | parse_urls)"})
+  it=("edit${T}📝 エディタに URL を貼り付ける")
+  (( $#cu )) && it+=("clip${T}📋 クリップボードの URL を使う  $DM($#cu 件)$R")
+  it+=("file${T}📄 テキストファイルから読み込む")
+  while true; do
+    menu "$CRUMB\n${B}URL の入れ方は？$R ${DM}(1 行に 1 つ · URL 以外の文字は無視)$R" ${${cu:+clip}:-edit} $it || return 1
+    case $REPLY in
+      clip) URLS=($cu) ;;
+      edit)
+        print -l "# ダウンロードしたい URL を 1 行に 1 つ貼り付けて、保存して閉じてください" \
+          "# (# で始まる行と URL 以外の文字は無視されます)" "" > $SESS/urls.txt
+        ${VISUAL:-${EDITOR:-nvim}} $SESS/urls.txt
+        URLS=(${(f)"$(grep -v '^#' $SESS/urls.txt | parse_urls)"}) ;;
+      file)
+        local sel
+        sel=$( { find $PWD -maxdepth 1 -name '*.txt'; find $HOME -maxdepth 3 -name '.*' -prune -o -name '*.txt' -print } 2>/dev/null | awk '!s[$0]++' |
+          $FZF --prompt='📄 ' --header="$CRUMB\n${B}URL の書かれたファイル$R" \
+            --footer="文字入力で絞り込み · Enter 決定 · Esc 戻る" \
+            --preview='bat --color=always --style=numbers {} 2>/dev/null || cat {}' --preview-window=$PVW) || continue
+        URLS=(${(f)"$(parse_urls < $sel)"}) ;;
+    esac
+    (( $#URLS )) && return 0
+    it[1]="edit${T}📝 エディタに URL を貼り付ける  ${WN}(URL が見つかりませんでした)$R"
+  done
+}
+
+dl_batch() {
+  local CRUMB sep=" $DM›$R " mode fmt step=1 JUMP= IN_BATCH=1 base="$A📦 まとめて$R"
+  local -a URLS OPTS; local OPTS_KIND=
+  if (( $# == 1 )) && [[ -f $1 ]]; then URLS=(${(f)"$(parse_urls < $1)"})
+  elif (( $# )); then URLS=(${(f)"$(print -rl -- $@ | parse_urls)"})
+  fi
+  CRUMB=$base
+  (( $#URLS )) || { batch_input || return 1 }
+  print -rl -- "${URLS[@]}" > $SESS/urls.list
+  local -a MENU_OPTS=(--preview="nl -w3 -s'  ' $SESS/urls.list" --preview-window=$PVW)
+  local vl="${P[vfmt]:-mp4} · $(qname ${P[vq]:-best})"
+  local al="${P[afmt]:-mp3}"; [[ $al == (mp3|m4a) ]] && al+=" · ${P[aq]:-192}kbps"
+  SCOPE=single RANGE= TITLE="$#URLS 件の URL"
+  while true; do
+    CRUMB="$base$sep$#URLS 件"
+    (( step > 1 )) && CRUMB+="$sep${${mode/video/動画}/audio/音声}"
+    case $step in
+      1) menu "$CRUMB\n${B}何として保存しますか？$R ${DM}(形式は前回の設定)$R" ${mode:-${P[bmode]:-video}} \
+           "video${T}🎬 $(pad 動画 8)$DM$vl$R" \
+           "audio${T}🎵 $(pad 音声 8)$DM$al$R" || { [[ -n $JUMP ]] && { step=$JUMP; continue }; return 1 }
+         [[ $REPLY != $mode ]] && OPTS_KIND=
+         mode=$REPLY
+         [[ $mode == video ]] && fmt=${P[vfmt]:-mp4} || fmt=${P[afmt]:-mp3}
+         step=2 ;;
+      2) pick_opts $mode $fmt || { step=1; continue }
+         go 3 ;;
+      3) pick_dir || { go 2; continue }
+         step=4 ;;
+      4) JUMP=4
+         if [[ $mode == video ]]; then video_args $fmt ${P[vq]:-best}; else audio_args $fmt ${P[aq]:-192}; fi
+         opt_args $mode $fmt
+         ARGS+=(--no-playlist -o '%(title).180B.%(ext)s')
+         confirm $mode "<URL>" $fmt "${${mode/video/$vl}/audio/$al}" 0 || { JUMP= step=3; continue }
+         case $REPLY in
+           start) break ;;
+           fmt) step=1 ;; opts) step=2 ;; dir) step=3 ;;
+           cookie) setup_cookie ;;
+           menu) NEXT=menu; return 0 ;;
+         esac ;;
+    esac
+  done
+  save_pref bmode $mode
+
+  local -a all ng
+  local i rc t0=$EPOCHREALTIME
+  for (( i = 1; i <= $#URLS; i++ )); do
+    print
+    print -r -- "$A━━ [$i/$#URLS]$R $DM$URLS[i]$R"
+    TITLE=
+    run_dl $OUTDIR $URLS[i] $ARGS; rc=$?
+    (( rc == 130 )) && { ng+=(${URLS[i,-1]}); print -r -- "  $WN⏹ 中止しました$R"; break }
+    if (( rc == 0 )); then all+=($FILES); else ng+=$URLS[i]; fi
+  done
+  FILES=($all) ELAPSED=$(( EPOCHREALTIME - t0 ))
+  add_history $mode
+  RES_NOTE="$OK✓ 成功 $(( $#URLS - $#ng ))$R"
+  if (( $#ng )); then
+    RES_NOTE+="  $ER✗ 失敗・未処理 $#ng$R"
+    FAILED_URLS=${(F)ng}
+  fi
+  show_results
+  FAILED_URLS=
+}
+
+quick() { # URL だけ渡されたとき
+  local CRUMB="$A▶ yd$R" url=$1 def=${P[mode]:-video}
+  if is_img_site $url; then
+    # 画像の投稿は情報が取れないのが普通なので、取れなければ画像を勧める
+    fetch_info $url
+    (( INFO_RC == 130 )) && return 1
+    (( INFO_RC )) && def=image
+  else
+    need_info $url || return 1
+  fi
+  local -a MENU_OPTS=(--preview="$SELF __card $SESS/info $SESS/thumb.jpg" --preview-window=$PVW)
+  menu "$CRUMB\n${B}どうやって保存しますか？$R" $def \
+    "video${T}🎬 動画" "audio${T}🎵 音声だけ" "image${T}📷 画像(サムネイル · 画像の投稿)" || return 1
+  save_pref mode $REPLY
+  run_mode $REPLY $url
+}
+
+run_mode() { # モード [URL]
+  local m=$1 u=$2
+  while true; do
+    NEXT=
+    dl_$m "$u" || return 0
+    [[ $NEXT == again ]] || return 0
+    u=
+  done
+}
+
+main_header() {
+  local v=$(yt_version) age= days
+  if [[ $v == (#b)([0-9](#c4)).([0-9]##).([0-9]##)* ]]; then
+    days=$(( (EPOCHSECONDS - $(date -d "$match[1]-$match[2]-$match[3]" +%s)) / 86400 ))
+    if (( days > 60 )); then age=" $WN(${days}日前 · 更新をおすすめ)$R"; else age=" $DM(${days}日前)$R"; fi
+  fi
+  print -r -- " $A╻ ╻╺┳┓$R"
+  print -r -- " $A┗┳┛ ┃┃$R   ${B}yt-dlp ランチャー$R ${DM}v$YD_VERSION$R"
+  print -r -- "  $A╹ ╺┻┛$R   ${DM}yt-dlp$R $v$age"
+  local c=$(clip_url)
+  [[ -n $c ]] && { print; print -r -- " 📋 $DM$(trunc $c $(( COLS - 12 )))$R" }
+  print " "
+}
+
+main_menu() {
+  local last=${P[mode]:-video}
+  while true; do
+    local -a MENU_OPTS=()
+    menu "$(main_header)" $last \
+      "video${T}🎬 $(pad 動画 16)${DM}mp4 · mkv · webm$R" \
+      "audio${T}🎵 $(pad 音声 16)${DM}mp3 · m4a · opus · flac$R" \
+      "image${T}📷 $(pad 画像 16)${DM}サムネイル · 画像の投稿$R" \
+      "batch${T}📦 $(pad まとめて 16)${DM}複数の URL を順番に$R" \
+      "hist${T}🕘 $(pad 履歴 16)${DM}保存したファイルを開く$R" \
+      "update${T}🔄 $(pad 'yt-dlp を更新' 16)${DM}エラーが出たらまずこれ$R" \
+      "quit${T}👋 終了" || return 0
+    last=$REPLY NEXT=
+    case $REPLY in
+      video|audio|image) save_pref mode $REPLY; run_mode $REPLY ;;
+      batch) dl_batch; while [[ $NEXT == again ]]; do NEXT=; dl_batch; done ;;
+      hist) history_menu ;;
+      update) do_update; pause ;;
+      quit) return 0 ;;
+    esac
+    [[ $NEXT == quit ]] && return 0
+  done
+}
+
+usage() {
+  cat <<EOF
+${A}${B}yd$R — yt-dlp ランチャー
+
+  ${B}yd$R                     メニューを開く
+  ${B}yd$R <URL>               URL を渡して、動画/音声/画像を選ぶ
+  ${B}yd video$R [URL]         動画 (mp4 / mkv / webm)
+  ${B}yd audio$R [URL]         音声 (mp3 / m4a / opus / flac / wav)
+  ${B}yd image$R [URL]         サムネイル・画像の投稿 (gallery-dl に自動で切替)
+  ${B}yd batch$R [URL...|file] 複数の URL をまとめて
+  ${B}yd history$R             保存したファイルの履歴
+  ${B}yd update$R              yt-dlp を更新
+  ${B}yd --version$R           バージョン
+
+  ${DM}操作: ↑↓ / j k で移動 · Enter 決定 · Esc 戻る · ダウンロード中は Ctrl+C で中止
+  ログ: ~/.yd_logs/  設定: ~/.config/yd/$R
+EOF
+}
+
+# ───────────────────────── 入口 ─────────────────────────
+
+case $1 in
+  __preview) preview_file $2; exit 0 ;;
+  __card) card $2 $3; exit 0 ;;
+  __dir) dir_preview $2; exit 0 ;;
+  -h|--help|help) usage; exit 0 ;;
+  -v|-V|--version|version) print -r -- "yd $YD_VERSION"; exit 0 ;;
+esac
+
+typeset -A HOWTO=(yt-dlp 'pipx install yt-dlp  (または brew install yt-dlp)' fzf 'brew install fzf  (0.63 以降が必要)'
+  ffmpeg 'sudo apt install ffmpeg  (または brew install ffmpeg)' jq 'sudo apt install jq')
+miss=0
+for c in yt-dlp fzf ffmpeg jq; do
+  (( $+commands[$c] )) && continue
+  print -r -- "$ER✗ $c が見つかりません$R  $DM→ $HOWTO[$c]$R"; miss=1
+done
+(( miss )) && exit 1
+
+mkdir -p $CONF $CACHE $LOGDIR
+SESS=$(mktemp -d ${TMPDIR:-/tmp}/yd.XXXXXX)
+LOG=$LOGDIR/yd_$(date +%Y%m%d_%H%M%S).log
+old=($LOGDIR/yd_*.log(Nom[30,-1])); (( $#old )) && command rm -f -- $old
+COLS=$(tput cols 2>/dev/null || print 80)
+load_prefs
+trap 'INTR=1' INT
+trap 'tput cnorm 2>/dev/null; command rm -rf -- $SESS' EXIT
+
+case $1 in
+  "") main_menu ;;
+  video|動画|v) run_mode video $2 ;;
+  audio|音声|a) run_mode audio $2 ;;
+  image|画像|i) run_mode image $2 ;;
+  batch|バッチ|b) shift; dl_batch "$@"; while [[ $NEXT == again ]]; do NEXT=; dl_batch; done ;;
+  history|履歴) history_menu ;;
+  update|更新) do_update ;;
+  *)
+    if norm_url $1; then quick $REPLY
+    else usage; exit 1; fi ;;
+esac
+[[ $NEXT == menu ]] && main_menu
+exit 0
