@@ -1413,14 +1413,24 @@ ${A}${B}yd$R — yt-dlp ランチャー
 EOF
 }
 
+# --help / --version の最後に出す作者表示と lapacks の案内
+lapius_footer() {
+  print -r -- "作者: Lapius (https://github.com/Lapius7)"
+  if (( $+commands[lapacks] )); then
+    print -r -- "@lapius のツール: lapacks で一覧・インストール・更新"
+  else
+    print -r -- "@lapius のツール: npm i -g @lapius/lapacks で一覧・インストール・更新を管理"
+  fi
+}
+
 # ───────────────────────── 入口 ─────────────────────────
 
 case $1 in
   __preview) preview_file $2; exit 0 ;;
   __card) card $2 $3; exit 0 ;;
   __dir) dir_preview $2; exit 0 ;;
-  -h|--help|help) usage; exit 0 ;;
-  -v|-V|--version|version) print -r -- "yd $YD_VERSION"; exit 0 ;;
+  -h|--help|help) usage; print; lapius_footer; exit 0 ;;
+  -v|-V|--version|version) print -r -- "yd $YD_VERSION"; lapius_footer; exit 0 ;;
 esac
 
 typeset -A HOWTO=(yt-dlp 'pipx install yt-dlp  (または brew install yt-dlp)' fzf 'brew install fzf  (0.63 以降が必要)'
