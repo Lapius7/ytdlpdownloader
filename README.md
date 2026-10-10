@@ -7,7 +7,7 @@ YouTube 以外にも yt-dlp が対応するサイト（ニコニコ・X・TikTok
 ## インストール
 
 ```bash
-npm i -g @lapius/ytdlpdownloader     # コマンドは yd
+pnpm add -g @lapius/ytdlpdownloader     # コマンドは yd
 ```
 
 [lapacks](https://github.com/Lapius7/lapacks) からも入れられる。

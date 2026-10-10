@@ -1419,7 +1419,7 @@ lapius_footer() {
   if (( $+commands[lapacks] )); then
     print -r -- "@lapius のツール: lapacks で一覧・インストール・更新"
   else
-    print -r -- "@lapius のツール: npm i -g @lapius/lapacks で一覧・インストール・更新を管理"
+    print -r -- "@lapius のツール: pnpm add -g @lapius/lapacks で一覧・インストール・更新を管理"
   fi
 }
 
