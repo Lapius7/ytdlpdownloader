@@ -1,9 +1,5 @@
 <div align="center">
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/Lapius7/ytdlpdownloader/main/docs/images/banner.png" alt="yt-dlp Downloader" width="100%">
-</p>
-
 <p align="center"><b>English</b> | <a href="README.ja.md">日本語</a></p>
 
 <h1 align="center">yt-dlp Downloader</h1>
